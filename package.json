@@ -20,8 +20,10 @@
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
+    "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.39.1",
+    "express": "^4.21.2",
     "openai": "^4.83.0",
     "pg": "^8.13.1",
     "readline-sync": "^1.4.10"
