@@ -75,6 +75,12 @@ const initializeChat = () => {
 
 initializeChat();
 
+// Utility function for delay
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Retry configuration
+const RETRY_DELAYS = [1000, 2000, 4000]; // Retry after 1s, 2s, then 4s
+
 // Get all todos
 app.get('/todos', async (req, res) => {
   try {
@@ -85,72 +91,90 @@ app.get('/todos', async (req, res) => {
   }
 });
 
-// Handle chat messages
+// Handle chat messages with retry logic
 app.post('/chat', async (req, res) => {
   const { message } = req.body;
   
-  try {
-    const result = await chat.sendMessage([{ text: message }]);
-    const response = await result.response;
-    const text = response.text();
-    
+  for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
     try {
-      const action = JSON.parse(text);
-      
-      if (action.type === "output") {
-        res.json({ reply: action.output });
-      } else if (action.type === "action") {
-        let observation;
-        
-        switch (action.function) {
-          case "createTodo":
-            const [newTodo] = await db
-              .insert(todosTable)
-              .values({
-                todo: action.input,
-              })
-              .returning({
-                id: todosTable.id,
-              });
-            observation = newTodo.id;
-            break;
-            
-          case "getAllTodos":
-            observation = await db.select().from(todosTable);
-            break;
-            
-          case "searchTodo":
-            observation = await db
-              .select()
-              .from(todosTable)
-              .where(ilike(todosTable.todo, `%${action.input}%`));
-            break;
-            
-          case "deleteTodoById":
-            await db.delete(todosTable).where(eq(todosTable.id, action.input));
-            observation = null;
-            break;
-            
-          default:
-            throw new Error('Invalid function call');
-        }
-        
-        const observationMsg = JSON.stringify({ observation });
-        const followUp = await chat.sendMessage([{ text: observationMsg }]);
-        const followUpResponse = await followUp.response;
-        const followUpAction = JSON.parse(followUpResponse.text());
-        
-        if (followUpAction.type === "output") {
-          res.json({ reply: followUpAction.output });
-        }
+      // If this isn't the first attempt, wait before retrying
+      if (attempt > 0) {
+        await delay(RETRY_DELAYS[attempt - 1]);
       }
-    } catch (parseError) {
-      console.error('Parse error:', parseError);
-      res.status(500).json({ error: 'Invalid response from AI' });
+
+      const result = await chat.sendMessage([{ text: message }]);
+      const response = await result.response;
+      const text = response.text();
+      
+      try {
+        const action = JSON.parse(text);
+        
+        if (action.type === "output") {
+          return res.json({ reply: action.output });
+        }
+        
+        if (action.type === "action") {
+          let observation;
+          
+          switch (action.function) {
+            case "getAllTodos":
+              observation = await db.select().from(todosTable);
+              break;
+            case "createTodo":
+              const [newTodo] = await db.insert(todosTable).values({ todo: action.input }).returning();
+              observation = newTodo.id;
+              break;
+            case "searchTodo":
+              observation = await db.select().from(todosTable).where(ilike(todosTable.todo, `%${action.input}%`));
+              break;
+            case "deleteTodoById":
+              await db.delete(todosTable).where(eq(todosTable.id, action.input));
+              observation = true;
+              break;
+          }
+          
+          // Send the observation back to the AI
+          const followUpResult = await chat.sendMessage([
+            {
+              text: JSON.stringify({ observation }),
+            },
+          ]);
+          const followUpResponse = await followUpResult.response;
+          const followUpText = followUpResponse.text();
+          const followUpAction = JSON.parse(followUpText);
+          
+          return res.json({ reply: followUpAction.output });
+        }
+      } catch (parseError) {
+        console.error('Error parsing AI response:', parseError);
+        return res.status(500).json({ 
+          error: 'Invalid response format from AI',
+          details: parseError.message 
+        });
+      }
+
+      // If we get here, something unexpected happened with the response format
+      throw new Error('Unexpected response format from AI');
+
+    } catch (error) {
+      // If this is a 503 error and we haven't exhausted our retries, continue to the next attempt
+      if (error.status === 503 && attempt < RETRY_DELAYS.length) {
+        console.log(`AI service unavailable, retrying in ${RETRY_DELAYS[attempt]}ms...`);
+        continue;
+      }
+
+      // If we've exhausted our retries or it's a different error, log it and return an error response
+      console.error('AI error:', error);
+      
+      // If this was our last attempt, send an error response
+      if (attempt === RETRY_DELAYS.length) {
+        return res.status(503).json({ 
+          error: 'AI service temporarily unavailable',
+          message: 'The service is currently experiencing high load. Please try again in a few moments.',
+          details: error.message 
+        });
+      }
     }
-  } catch (error) {
-    console.error('AI error:', error);
-    res.status(500).json({ error: error.message });
   }
 });
 
